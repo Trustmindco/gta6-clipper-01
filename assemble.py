@@ -85,6 +85,20 @@ TITLE = (
     "Goodbye Los Santos, Welcome to Leonida"
 )
 
+# Final-assembly timing pass (20 Nov 2026): the narration is recorded
+# line by line, so each shot is held for exactly its line's window —
+# slowed where the line runs long, trimmed where it does not. Shots 6
+# (collage drift) and 7 (closing close-up) are first doubled by
+# ping-pong (forward + reverse) so their slow-down stays gentle, and
+# shot 8 carries the real GTA VI logo as a graphic overlay, per the
+# production script's note (the logo is never model-generated).
+SHOT_TARGET = {
+    "shot1": 4.30, "shot2": 2.10, "shot3": 2.10, "shot4": 5.10,
+    "shot5a": 3.06, "shot5b": 3.06, "shot5c": 3.06,
+    "shot6": 9.60, "shot7": 8.90, "shot8": 7.85,
+}
+PINGPONG = {"shot6", "shot7"}
+
 
 # --------------------------------------------------------------------------
 # Small helpers
@@ -137,11 +151,29 @@ def drawtext(textfile, font, size, colour, x, y):
 # Build steps
 # --------------------------------------------------------------------------
 
+def pingpong(src, stem, workdir):
+    """Forward + reverse copy of a clip: a seamless doubled source."""
+    out = os.path.join(workdir, f"{stem}_pp.mp4")
+    run(
+        ["ffmpeg", "-y", "-v", "error", "-i", src,
+         "-filter_complex",
+         "[0:v]split[a][b];[b]reverse[br];[a][br]concat=n=2:v=1:a=0[v]",
+         "-map", "[v]", "-c:v", "libx264", "-preset", "medium",
+         "-crf", "16", "-pix_fmt", "yuv420p", out],
+        f"pingpong {stem}",
+    )
+    return out
+
+
 def normalise_clip(src, stem, main, sub, main_colour, sub_colour,
-                   workdir, font):
+                   workdir, font, target=None, logo=None):
     """One shot -> 1080x1920, 30 fps, caption burned, silent AAC track."""
     dur = probe_duration(src)
-    filters = [
+    out_dur = target if target else dur
+    filters = []
+    if target and target > dur * 1.02:
+        filters.append(f"setpts={target / dur:.4f}*PTS")
+    filters += [
         f"scale={VIDEO_W}:{VIDEO_H}:force_original_aspect_ratio=increase",
         f"crop={VIDEO_W}:{VIDEO_H}",
         f"fps={FPS}",
@@ -160,16 +192,25 @@ def normalise_clip(src, stem, main, sub, main_colour, sub_colour,
             ssize = fit_fontsize(sub, 54)
             filters.append(drawtext(subfile, font, ssize, sub_colour,
                                     "(w-text_w)/2", main_y + size + 34))
-    graph = "[0:v]" + ",".join(filters) + "[vout]"
+    if logo:
+        graph = (
+            "[0:v]" + ",".join(filters) + "[vbase];"
+            "[2:v]scale=620:-1,format=rgba[logo];"
+            "[vbase][logo]overlay=(W-w)/2:(H*0.15)[vout]"
+        )
+    else:
+        graph = "[0:v]" + ",".join(filters) + "[vout]"
     script = os.path.join(workdir, f"{stem}_filter.txt")
     write_text(script, graph)
     out = os.path.join(workdir, f"{stem}_norm.mp4")
+    inputs = ["-i", src, "-f", "lavfi", "-i", "anullsrc=cl=stereo:r=48000"]
+    if logo:
+        inputs += ["-i", logo]
     run(
-        ["ffmpeg", "-y", "-v", "error", "-i", src,
-         "-f", "lavfi", "-i", "anullsrc=cl=stereo:r=48000",
+        ["ffmpeg", "-y", "-v", "error", *inputs,
          "-filter_complex_script", script,
          "-map", "[vout]", "-map", "1:a",
-         "-t", f"{dur:.3f}",
+         "-t", f"{out_dur:.3f}",
          "-c:v", "libx264", "-preset", "medium", "-crf", "18",
          "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k",
          "-ar", "48000", "-ac", "2", out],
@@ -327,6 +368,11 @@ def main(argv=None):
                              "assets", "Anton.ttf"),
         help="Anton font file used for the burned-in text")
     parser.add_argument(
+        "--logo",
+        default=os.path.join(home, "workspace", "gta6-video", "stills",
+                             "logo-gtavi.png"),
+        help="transparent GTA VI logo PNG overlaid on shot 8")
+    parser.add_argument(
         "--youtube-url", default=None,
         help="when given, (re)write VIDEO.json at the repo root with "
              "this YouTube address")
@@ -365,8 +411,16 @@ def main(argv=None):
 
     parts = []
     for stem, path, main_t, sub_t, mc, sc in present:
-        parts.append(normalise_clip(path, stem, main_t, sub_t, mc, sc,
-                                    workdir, args.font))
+        src = path
+        if stem in PINGPONG:
+            src = pingpong(path, stem, workdir)
+        logo = None
+        if stem == "shot8" and os.path.isfile(args.logo):
+            logo = args.logo
+        parts.append(normalise_clip(src, stem, main_t, sub_t, mc, sc,
+                                    workdir, args.font,
+                                    target=SHOT_TARGET.get(stem),
+                                    logo=logo))
         print(f"  normalised {stem}")
     parts.append(build_endcard(workdir, args.font))
     print("  built make.fun pitch end-card (3s)")
